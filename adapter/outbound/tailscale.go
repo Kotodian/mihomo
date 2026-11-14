@@ -6,16 +6,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface/anet"
+	"github.com/metacubex/mihomo/component/keepalive"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
@@ -28,6 +32,7 @@ import (
 	"github.com/metacubex/tailscale/net/netmon"
 	"github.com/metacubex/tailscale/tailcfg"
 	"github.com/metacubex/tailscale/tsnet"
+	"github.com/metacubex/tailscale/types/nettype"
 	D "github.com/miekg/dns"
 	"github.com/samber/lo"
 )
@@ -48,22 +53,235 @@ type Tailscale struct {
 
 	serverStarted bool
 
+	hostForward           *tailscaleHostForwarder
+	unregisterHostForward []func()
 	unregisterDNSResolver func()
 }
 
 type TailscaleOption struct {
 	BasicOption
-	Name       string `proxy:"name"`
-	Hostname   string `proxy:"hostname,omitempty"`
-	AuthKey    string `proxy:"auth-key,omitempty"`
-	ControlURL string `proxy:"control-url,omitempty"`
-	StateDir   string `proxy:"state-dir,omitempty"`
-	Ephemeral  bool   `proxy:"ephemeral,omitempty"`
-	UDP        bool   `proxy:"udp,omitempty"`
+	Name        string                     `proxy:"name"`
+	Hostname    string                     `proxy:"hostname,omitempty"`
+	AuthKey     string                     `proxy:"auth-key,omitempty"`
+	ControlURL  string                     `proxy:"control-url,omitempty"`
+	StateDir    string                     `proxy:"state-dir,omitempty"`
+	Ephemeral   bool                       `proxy:"ephemeral,omitempty"`
+	UDP         bool                       `proxy:"udp,omitempty"`
+	HostForward TailscaleHostForwardOption `proxy:"host-forward,omitempty"`
 
 	AcceptRoutes           *bool  `proxy:"accept-routes,omitempty"`
 	ExitNode               string `proxy:"exit-node,omitempty"`
 	ExitNodeAllowLANAccess *bool  `proxy:"exit-node-allow-lan-access,omitempty"`
+}
+
+type TailscaleHostForwardOption struct {
+	Enabled bool   `proxy:"enabled,omitempty"`
+	Mode    string `proxy:"mode,omitempty"`
+	Target  string `proxy:"target,omitempty"`
+	TCP     *bool  `proxy:"tcp,omitempty"`
+	UDP     *bool  `proxy:"udp,omitempty"`
+	Device  string `proxy:"device,omitempty"`
+	MTU     uint32 `proxy:"mtu,omitempty"`
+}
+
+const (
+	tailscaleHostForwardModeUserspace = "userspace"
+	tailscaleHostForwardModeKernel    = "kernel"
+
+	tailscaleHostForwardUDPIdleTimeout               = 2 * time.Minute
+	tailscaleHostForwardNetstackKeepaliveIdleEnv     = "TS_NETSTACK_KEEPALIVE_IDLE"
+	tailscaleHostForwardNetstackKeepaliveIdle        = "60s"
+	tailscaleHostForwardNetstackKeepaliveIntervalEnv = "TS_NETSTACK_KEEPALIVE_INTERVAL"
+	tailscaleHostForwardNetstackKeepaliveInterval    = "15s"
+)
+
+var tailscaleHostForwardDefaultTarget = netip.MustParseAddr("127.0.0.1")
+
+func tailscaleHostForwardMode(option TailscaleHostForwardOption) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(option.Mode))
+	if mode == "" {
+		return tailscaleHostForwardModeUserspace, nil
+	}
+	switch mode {
+	case tailscaleHostForwardModeUserspace:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported tailscale host-forward mode %q", option.Mode)
+	}
+}
+
+type tailscaleHostForwarder struct {
+	ctx         context.Context
+	name        string
+	target      netip.Addr
+	tcp         bool
+	udp         bool
+	tailscaleIP func() (netip.Addr, netip.Addr)
+	dialContext func(context.Context, string, string) (net.Conn, error)
+}
+
+func newTailscaleHostForwarder(
+	ctx context.Context,
+	name string,
+	option TailscaleHostForwardOption,
+	tailscaleIP func() (netip.Addr, netip.Addr),
+) (*tailscaleHostForwarder, error) {
+	if !option.Enabled {
+		return nil, nil
+	}
+
+	target := option.Target
+	if target == "" {
+		target = tailscaleHostForwardDefaultTarget.String()
+	}
+	targetIP, err := netip.ParseAddr(target)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tailscale host-forward target %q: %w", target, err)
+	}
+	targetIP = targetIP.Unmap()
+	if !targetIP.IsLoopback() {
+		return nil, fmt.Errorf("tailscale host-forward target must be a loopback address: %s", targetIP)
+	}
+
+	tcpEnabled := option.TCP == nil || *option.TCP
+	udpEnabled := option.UDP == nil || *option.UDP
+	if !tcpEnabled && !udpEnabled {
+		return nil, errors.New("tailscale host-forward requires tcp or udp")
+	}
+
+	dialer := &net.Dialer{}
+	keepalive.SetNetDialer(dialer)
+	return &tailscaleHostForwarder{
+		ctx:         ctx,
+		name:        name,
+		target:      targetIP,
+		tcp:         tcpEnabled,
+		udp:         udpEnabled,
+		tailscaleIP: tailscaleIP,
+		dialContext: dialer.DialContext,
+	}, nil
+}
+
+func (f *tailscaleHostForwarder) accepts(dst netip.AddrPort) bool {
+	dstAddr := dst.Addr().Unmap()
+	v4, v6 := f.tailscaleIP()
+	return (v4.IsValid() && dstAddr == v4.Unmap()) || (v6.IsValid() && dstAddr == v6.Unmap())
+}
+
+func (f *tailscaleHostForwarder) targetAddress(dst netip.AddrPort) string {
+	return netip.AddrPortFrom(f.target, dst.Port()).String()
+}
+
+func (f *tailscaleHostForwarder) handleTCP(src, dst netip.AddrPort) (func(net.Conn), bool) {
+	if !f.tcp || !f.accepts(dst) {
+		return nil, false
+	}
+	target := f.targetAddress(dst)
+	return func(client net.Conn) {
+		keepalive.TCPKeepAlive(client)
+		backend, err := f.dialContext(f.ctx, "tcp", target)
+		if err != nil {
+			log.Debugln("[Tailscale](%s) host-forward TCP %s -> %s failed: %v", f.name, src, target, err)
+			_ = client.Close()
+			return
+		}
+		keepalive.TCPKeepAlive(backend)
+		log.Debugln("[Tailscale](%s) host-forward TCP %s -> %s", f.name, src, target)
+		N.Relay(client, backend)
+	}, true
+}
+
+func configureTailscaleHostForwardNetstackKeepalive() {
+	setTailscaleEnvDefault(tailscaleHostForwardNetstackKeepaliveIdleEnv, tailscaleHostForwardNetstackKeepaliveIdle)
+	setTailscaleEnvDefault(tailscaleHostForwardNetstackKeepaliveIntervalEnv, tailscaleHostForwardNetstackKeepaliveInterval)
+}
+
+func setTailscaleEnvDefault(name, value string) {
+	if os.Getenv(name) != "" {
+		return
+	}
+	envknob.Setenv(name, value)
+}
+
+func (f *tailscaleHostForwarder) handleUDP(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+	if !f.udp || !f.accepts(dst) {
+		return nil, false
+	}
+	target := f.targetAddress(dst)
+	return func(client nettype.ConnPacketConn) {
+		backend, err := f.dialContext(f.ctx, "udp", target)
+		if err != nil {
+			log.Debugln("[Tailscale](%s) host-forward UDP %s -> %s failed: %v", f.name, src, target, err)
+			_ = client.Close()
+			return
+		}
+		log.Debugln("[Tailscale](%s) host-forward UDP %s -> %s", f.name, src, target)
+		_ = relayTailscaleHostUDP(f.ctx, client, backend, tailscaleHostForwardUDPIdleTimeout)
+	}, true
+}
+
+func relayTailscaleHostUDP(ctx context.Context, client nettype.ConnPacketConn, backend net.Conn, idleTimeout time.Duration) error {
+	refreshDeadline := func() {
+		deadline := time.Now().Add(idleTimeout)
+		_ = client.SetDeadline(deadline)
+		_ = backend.SetDeadline(deadline)
+	}
+	refreshDeadline()
+
+	copyClientToBackend := func() error {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, _, err := client.ReadFrom(buffer)
+			if err != nil {
+				return err
+			}
+			written, err := backend.Write(buffer[:n])
+			if err != nil {
+				return err
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+			refreshDeadline()
+		}
+	}
+	copyBackendToClient := func() error {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, err := backend.Read(buffer)
+			if err != nil {
+				return err
+			}
+			written, err := client.Write(buffer[:n])
+			if err != nil {
+				return err
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+			refreshDeadline()
+		}
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- copyClientToBackend() }()
+	go func() { errCh <- copyBackendToClient() }()
+
+	completed := 0
+	var firstErr error
+	select {
+	case firstErr = <-errCh:
+		completed = 1
+	case <-ctx.Done():
+		firstErr = ctx.Err()
+	}
+	_ = client.Close()
+	_ = backend.Close()
+	for completed < 2 {
+		<-errCh
+		completed++
+	}
+	return firstErr
 }
 
 func init() {
@@ -114,6 +332,11 @@ func init() {
 func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	if _, err := buildTailscaleMaskedPrefs(option); err != nil {
 		return nil, err
+	}
+	if option.HostForward.Enabled {
+		if _, err := tailscaleHostForwardMode(option.HostForward); err != nil {
+			return nil, err
+		}
 	}
 	if option.StateDir == "" {
 		option.StateDir = "tailscale"
@@ -180,6 +403,26 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	hostForward, err := newTailscaleHostForwarder(ctx, option.Name, option.HostForward, outbound.server.TailscaleIPs)
+	if err != nil {
+		_ = outbound.Close()
+		return nil, err
+	}
+	outbound.hostForward = hostForward
+	if hostForward != nil {
+		configureTailscaleHostForwardNetstackKeepalive()
+		if hostForward.tcp {
+			outbound.unregisterHostForward = append(outbound.unregisterHostForward, outbound.server.RegisterFallbackTCPHandler(hostForward.handleTCP))
+		}
+		if hostForward.udp {
+			outbound.unregisterHostForward = append(outbound.unregisterHostForward, outbound.server.RegisterFallbackUDPHandler(hostForward.handleUDP))
+		}
+		if err := outbound.start(); err != nil {
+			_ = outbound.Close()
+			return nil, fmt.Errorf("start tailscale proxy: %w", err)
+		}
+		log.Infoln("[Tailscale](%s) host-forward enabled: tcp=%v udp=%v target=%s", option.Name, hostForward.tcp, hostForward.udp, hostForward.target)
+	}
 	return outbound, nil
 }
 
@@ -466,6 +709,10 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 
 func (t *Tailscale) Close() error {
 	t.cancel()
+	for _, unregister := range t.unregisterHostForward {
+		unregister()
+	}
+	t.unregisterHostForward = nil
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()
 	}
