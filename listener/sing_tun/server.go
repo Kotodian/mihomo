@@ -15,6 +15,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/hosttun"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -134,6 +135,7 @@ func checkTunName(tunName string) (ok bool) {
 }
 
 func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Listener, err error) {
+	defaultTUN := len(additions) == 0
 	if len(additions) == 0 {
 		additions = []inbound.Addition{
 			inbound.WithInName("DEFAULT-TUN"),
@@ -488,6 +490,15 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		err = E.Cause(err, "configure tun interface")
 		return
 	}
+	l.tunIf = tunIf
+	if defaultTUN {
+		tunIf, err = hosttun.Wrap(tunIf, tunName, options.AutoRoute)
+		if err != nil {
+			err = E.Cause(err, "attach shared host TUN")
+			return
+		}
+		l.tunIf = tunIf
+	}
 
 	l.dnsServerIp = dnsServerIp
 	// after tun.New sing-tun has set DNS to TUN interface
@@ -507,8 +518,6 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		TCPCongestionControl:   options.CongestionController,
 		EnforceBindInterface:   EnforceBindInterface,
 	}
-	l.tunIf = tunIf
-
 	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
 	if err != nil {
 		return
