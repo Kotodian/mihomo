@@ -47,7 +47,7 @@ func (s SocketFactory) ConnectTCP(ctx context.Context, options platform.TCPConne
 
 func (s SocketFactory) BindUDP(ctx context.Context, options platform.UDPBindOptions) (net.PacketConn, error) {
 	network, address := udpBind(options)
-	return s.Dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+	return listenUDP(ctx, s.Dialer, network, address)
 }
 
 func (s SocketFactory) ListenTCP(ctx context.Context, options platform.TCPListenOptions) (net.Listener, error) {

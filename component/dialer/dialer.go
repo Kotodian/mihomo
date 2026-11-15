@@ -96,6 +96,12 @@ func Listen(ctx context.Context, network, address string, options ...Option) (ne
 }
 
 func listenConfig(network, address string, rAddrPort netip.AddrPort, opt option) (*net.ListenConfig, string, error) {
+	return listenConfigWithInterfaceBinder(network, address, rAddrPort, opt, bindIfaceToListenConfig)
+}
+
+func listenConfigWithInterfaceBinder(network, address string, rAddrPort netip.AddrPort, opt option,
+	bindInterface func(string, *net.ListenConfig, string, string, netip.AddrPort) (string, error),
+) (*net.ListenConfig, string, error) {
 	lc := &net.ListenConfig{}
 	if opt.addrReuse {
 		addrReuseToListenConfig(lc)
@@ -116,7 +122,7 @@ func listenConfig(network, address string, rAddrPort netip.AddrPort, opt option)
 			opt.interfaceName = ""
 		}
 		if opt.interfaceName != "" {
-			bind := bindIfaceToListenConfig
+			bind := bindInterface
 			if opt.fallbackBind {
 				bind = fallbackBindIfaceToListenConfig
 			}
