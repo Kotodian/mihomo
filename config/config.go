@@ -227,6 +227,7 @@ type RawDNS struct {
 	UseSystemHosts               bool                                `yaml:"use-system-hosts" json:"use-system-hosts"`
 	RespectRules                 bool                                `yaml:"respect-rules" json:"respect-rules"`
 	NameServer                   []string                            `yaml:"nameserver" json:"nameserver"`
+	DoHECH                       map[string]rawDoHECH                `yaml:"doh-ech" json:"doh-ech"`
 	Fallback                     []string                            `yaml:"fallback" json:"fallback"`
 	FallbackFilter               RawFallbackFilter                   `yaml:"fallback-filter" json:"fallback-filter"`
 	FallbackLazyQuery            bool                                `yaml:"fallback-lazy-query" json:"fallback-lazy-query"`
@@ -1468,6 +1469,9 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, errors.New("default nameserver should have at least one nameserver")
 	}
 	if dnsCfg.DefaultNameserver, err = parseNameServer(cfg.DefaultNameserver, false, cfg.PreferH3); err != nil {
+		return nil, err
+	}
+	if err := configureDoHECH(cfg.DoHECH, dnsCfg); err != nil {
 		return nil, err
 	}
 	// check default nameserver is pure ip addr
