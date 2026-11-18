@@ -1411,6 +1411,11 @@ proxies: # socks5
     # hostname: mihomo
     # ipv4: 10.144.0.1/24
     # dhcp: true # ipv4 为空时默认开启，否则实例没有 overlay IPv4
+    # host-stack: system # macOS：将原始入站 IPv4 包交给宿主系统协议栈；默认 none
+    # 复用顶层 tun（需 enable: true、auto-route: true），不创建新 TUN
+    # 给同一 utun 添加本机 overlay IPv4 /32 alias，保留代理地址和现有路由
+    # 宿主服务需监听 overlay IP 或 0.0.0.0；仅监听 loopback 的服务不可访问
+    # 支持 system / mixed / gvisor TUN 栈；出站 Dial/UDP 仍使用 EasyTier 原有路径
     peers: # 可配置多个入口；默认不隐式连接 public.easytier.top；无 listeners 时至少填一个
       - tcp://192.0.2.10:11010
       - udp://192.0.2.11:11010

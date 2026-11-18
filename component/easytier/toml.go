@@ -9,6 +9,11 @@ import (
 
 const defaultListener = "tcp://0.0.0.0:11010"
 
+const (
+	HostStackNone   = "none"
+	HostStackSystem = "system"
+)
+
 type requiredFlag struct {
 	key   string
 	value string
@@ -21,6 +26,7 @@ type Config struct {
 	Hostname            string
 	IPv4                string
 	DHCP                bool
+	HostStack           string
 	Peers               []string
 	Listeners           []string
 	NoListener          *bool
@@ -67,6 +73,11 @@ func (c Config) listeners() []string {
 
 // ValidateStructured checks structured fields before rendering TOML.
 func (c Config) ValidateStructured() error {
+	switch c.HostStack {
+	case "", HostStackNone, HostStackSystem:
+	default:
+		return fmt.Errorf("easytier: unsupported host-stack %q", c.HostStack)
+	}
 	if strings.TrimSpace(c.NetworkName) == "" {
 		return fmt.Errorf("easytier: network-name is required")
 	}
@@ -225,7 +236,9 @@ func (c Config) RenderTOML() (string, error) {
 	}
 
 	encoded.WriteString("\n[flags]\n")
-	writeTOMLBoolField(&encoded, "no_tun", true)
+	// The embedded core exposes its TUN as raw packet IO; it does not create
+	// an OS interface. System mode connects this IO to mihomo's existing TUN.
+	writeTOMLBoolField(&encoded, "no_tun", c.HostStack != HostStackSystem)
 	writeTOMLBoolField(&encoded, "bind_device", false)
 	writeOptionalBoolField(&encoded, "accept_dns", c.AcceptDNS)
 	writeOptionalBoolField(&encoded, "enable_exit_node", c.EnableExitNode)
@@ -256,7 +269,8 @@ func requiredFlags() []requiredFlag {
 	}
 }
 
-// ApplyRequiredFlags forces no_tun and bind_device=false.
+// ApplyRequiredFlags forces the default outbound-only flags. RenderTOML selects
+// no_tun=false explicitly for HostStackSystem; do not apply this default to it.
 func ApplyRequiredFlags(configTOML string) string {
 	flags := requiredFlags()
 	required := make(map[string]string, len(flags))

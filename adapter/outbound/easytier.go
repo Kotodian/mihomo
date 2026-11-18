@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/easytier"
+	"github.com/metacubex/mihomo/component/hosttun"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
@@ -36,21 +37,23 @@ var errEasyTierClosed = errors.New("easytier outbound closed")
 
 type EasyTier struct {
 	*Base
-	option     EasyTierOption
-	configTOML string
-	stateDir   string
-	instanceID string
-	zone       string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	loopOnce   sync.Once
-	startMu    sync.Mutex
-	closed     bool
-	readyCh    chan struct{}
-	mu         sync.Mutex
-	host       *corehost.Host
-	instance   *corehost.Instance
-	unregister func()
+	option      EasyTierOption
+	configTOML  string
+	stateDir    string
+	instanceID  string
+	zone        string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	loopOnce    sync.Once
+	lifecycleMu sync.Mutex
+	startMu     sync.Mutex
+	closed      bool
+	readyCh     chan struct{}
+	mu          sync.Mutex
+	host        *corehost.Host
+	instance    *corehost.Instance
+	packets     *easyTierHostPackets
+	unregister  func()
 }
 
 type EasyTierOption struct {
@@ -61,6 +64,7 @@ type EasyTierOption struct {
 	Hostname            string   `proxy:"hostname,omitempty"`
 	IPv4                string   `proxy:"ipv4,omitempty"`
 	DHCP                bool     `proxy:"dhcp,omitempty"`
+	HostStack           string   `proxy:"host-stack,omitempty"`
 	Peers               []string `proxy:"peers,omitempty"`
 	Listeners           []string `proxy:"listeners,omitempty"`
 	NoListener          *bool    `proxy:"no-listener,omitempty"`
@@ -99,6 +103,7 @@ func (o EasyTierOption) structuredConfig() easytier.Config {
 		Hostname:            o.Hostname,
 		IPv4:                o.IPv4,
 		DHCP:                o.DHCP,
+		HostStack:           o.HostStack,
 		Peers:               o.Peers,
 		Listeners:           o.Listeners,
 		NoListener:          o.NoListener,
@@ -126,11 +131,14 @@ func (o EasyTierOption) structuredConfig() easytier.Config {
 }
 
 func NewEasyTier(option EasyTierOption) (*EasyTier, error) {
+	option.HostStack = strings.ToLower(strings.TrimSpace(option.HostStack))
+	if option.HostStack == easytier.HostStackSystem && !hosttun.Supported {
+		return nil, errors.New("easytier: host-stack system requires macOS and the existing default TUN")
+	}
 	configTOML, err := option.structuredConfig().RenderTOML()
 	if err != nil {
 		return nil, err
 	}
-	configTOML = easytier.ApplyRequiredFlags(configTOML)
 
 	stateDir := option.StateDir
 	if stateDir == "" {
@@ -166,6 +174,10 @@ func NewEasyTier(option EasyTierOption) (*EasyTier, error) {
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	outbound.unregister = dns.RegisterEasyTierDnsClient(option.Name, easyTierDNSTransport{easytier: outbound})
+	if option.HostStack == easytier.HostStackSystem {
+		// Inbound host traffic must work before any outbound dial or DNS query.
+		outbound.loopOnce.Do(func() { go outbound.loop() })
+	}
 	return outbound, nil
 }
 
@@ -282,6 +294,11 @@ func (e *EasyTier) loop() {
 }
 
 func (e *EasyTier) init() error {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	if e.ctx.Err() != nil {
+		return errEasyTierClosed
+	}
 	if err := os.MkdirAll(e.stateDir, 0o755); err != nil {
 		return fmt.Errorf("easytier: create state-dir: %w", err)
 	}
@@ -291,7 +308,7 @@ func (e *EasyTier) init() error {
 		instanceName = e.option.Name
 	}
 	host, err := corehost.New(e.ctx, corehost.Options{
-		Platform: easytier.Services(e.dialer),
+		Platform: easytier.Services(e.dialer, e.option.Interface),
 	})
 	if err != nil {
 		return err
@@ -314,18 +331,96 @@ func (e *EasyTier) init() error {
 	if err := instance.Start(e.ctx); err != nil {
 		return err
 	}
+	if e.ctx.Err() != nil {
+		return errEasyTierClosed
+	}
 	log.Infoln("[EasyTier](%s) instance %s running", e.Name(), instance.ID())
-	go e.drainHostPackets(instance)
+	ctx, cancel := context.WithCancel(e.ctx)
+	packets := &easyTierHostPackets{cancel: cancel, done: make(chan struct{})}
+	if e.option.HostStack == easytier.HostStackSystem {
+		name := fmt.Sprintf("EasyTier/%s/%s", e.option.ProviderName, e.Name())
+		packets.binding = hosttun.New(ctx, name, instance.SendPacket)
+	}
+	e.packets = packets
+	go e.receiveHostPackets(ctx, instance, packets)
 	return nil
 }
 
-// The outbound uses the core's netstack, not a host TUN device. Drain unused
-// raw IP packets so the bounded host packet queue cannot stall the data plane.
-// ReceivePacket unblocks when the instance closes or the adapter is canceled.
-func (e *EasyTier) drainHostPackets(instance *corehost.Instance) {
+type easyTierHostPackets struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	binding *hosttun.Binding
+}
+
+// Each instance has exactly one raw packet consumer. Default mode drains its
+// unused bounded queue; system mode writes the original IP packets to the TUN.
+func (e *EasyTier) receiveHostPackets(ctx context.Context, instance *corehost.Instance, packets *easyTierHostPackets) {
+	defer close(packets.done)
+	defer packets.cancel()
+	if packets.binding != nil {
+		defer func() {
+			if err := packets.binding.Close(); err != nil {
+				log.Warnln("[EasyTier](%s) close host stack: %v", e.Name(), err)
+			}
+		}()
+		addressDone := make(chan struct{})
+		go func() {
+			defer close(addressDone)
+			e.refreshHostAddress(ctx, instance, packets.binding)
+		}()
+		defer func() {
+			packets.cancel()
+			<-addressDone
+		}()
+	}
 	for {
-		if _, err := instance.ReceivePacket(e.ctx); err != nil {
+		packet, err := instance.ReceivePacket(ctx)
+		if err != nil {
 			return
+		}
+		if packets.binding != nil {
+			if err := packets.binding.Inject(packet); err != nil && ctx.Err() == nil {
+				log.Debugln("[EasyTier](%s) inject host packet: %v", e.Name(), err)
+			}
+		}
+	}
+}
+
+func (e *EasyTier) refreshHostAddress(ctx context.Context, instance *corehost.Instance, binding *hosttun.Binding) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	lastError := ""
+	for {
+		queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		info, err := instance.ShowNodeInfo(queryCtx)
+		cancel()
+		if err == nil {
+			var address netip.Addr
+			if info != nil && info.GetIpv4Addr() != "" {
+				address, err = easytier.ParseNodeIPv4(info.GetIpv4Addr())
+				if address.IsUnspecified() {
+					address = netip.Addr{}
+				}
+			}
+			if err == nil {
+				err = binding.SetAddress(address)
+			}
+		}
+		if ctx.Err() != nil || errors.Is(err, os.ErrClosed) {
+			return
+		}
+		if err != nil {
+			if message := err.Error(); message != lastError {
+				log.Warnln("[EasyTier](%s) update host-stack address: %v", e.Name(), err)
+				lastError = message
+			}
+		} else {
+			lastError = ""
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
@@ -530,14 +625,21 @@ func (e *EasyTier) Close() error {
 }
 
 func (e *EasyTier) shutdown() error {
-	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
-	defer cancel()
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
 	e.mu.Lock()
 	instance := e.instance
 	host := e.host
 	e.instance = nil
 	e.host = nil
 	e.mu.Unlock()
+	if e.packets != nil {
+		e.packets.cancel()
+		<-e.packets.done
+		e.packets = nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+	defer cancel()
 	var err error
 	if instance != nil {
 		err = instance.Close(ctx)

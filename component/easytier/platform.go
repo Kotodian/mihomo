@@ -15,13 +15,44 @@ import (
 	D "github.com/miekg/dns"
 )
 
-// Services wraps a mihomo dialer as EasyTier platform capabilities.
-func Services(d C.Dialer) platform.Services {
+// Services provides EasyTier with the dialer and its LAN address candidates.
+func Services(d C.Dialer, interfaceName string) platform.Services {
+	if interfaceName == "" {
+		interfaceName = dialer.DefaultInterface.Load()
+	}
 	return platform.Services{
 		Sockets:     SocketFactory{Dialer: d},
 		DNS:         DNSResolver{},
 		Environment: ConnectorEnvironment{Dialer: d},
+		Snapshot:    interfaceSnapshot(interfaceName),
 	}
+}
+
+func interfaceSnapshot(name string) platform.EnvironmentSnapshot {
+	var snapshot platform.EnvironmentSnapshot
+	if name == "" {
+		return snapshot
+	}
+	iface, err := net.InterfaceByName(name)
+	if err != nil || iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+		return snapshot
+	}
+	addresses, err := iface.Addrs()
+	if err != nil {
+		return snapshot
+	}
+	for _, addr := range addresses {
+		prefix, err := netip.ParsePrefix(addr.String())
+		if err != nil {
+			continue
+		}
+		ip := prefix.Addr().Unmap()
+		if ip.Is4() && ip.IsGlobalUnicast() {
+			snapshot.InterfaceIPv4s = append(snapshot.InterfaceIPv4s, ip)
+			snapshot.LocalIPs = append(snapshot.LocalIPs, ip)
+		}
+	}
+	return snapshot
 }
 
 // SocketFactory creates sockets through mihomo's dialer.
@@ -47,7 +78,7 @@ func (s SocketFactory) ConnectTCP(ctx context.Context, options platform.TCPConne
 
 func (s SocketFactory) BindUDP(ctx context.Context, options platform.UDPBindOptions) (net.PacketConn, error) {
 	network, address := udpBind(options)
-	return s.Dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+	return listenUDP(ctx, s.Dialer, network, address)
 }
 
 func (s SocketFactory) ListenTCP(ctx context.Context, options platform.TCPListenOptions) (net.Listener, error) {
