@@ -308,7 +308,7 @@ func (e *EasyTier) init() error {
 		instanceName = e.option.Name
 	}
 	host, err := corehost.New(e.ctx, corehost.Options{
-		Platform: easytier.Services(e.dialer),
+		Platform: easytier.Services(e.dialer, e.option.Interface),
 	})
 	if err != nil {
 		return err
