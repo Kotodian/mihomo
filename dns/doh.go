@@ -36,9 +36,9 @@ const (
 	// connections in HTTP transport.
 	transportDefaultIdleConnTimeout = 5 * time.Minute
 
-	dialTimeout        = 10 * time.Second
+	dialTimeout = 10 * time.Second
 
-	maxElapsedTime  = time.Second * 30
+	maxElapsedTime = time.Second * 30
 )
 
 var DefaultHTTPVersions = []C.HTTPVersion{C.HTTPVersion11, C.HTTPVersion2}
@@ -63,6 +63,9 @@ type dnsOverHTTPS struct {
 	addr           string
 	skipCertVerify bool
 	nameCertVerify string
+	echConfig      string
+	echRetryConfig []byte // guarded by clientMu
+	echFallback    dnsClient
 }
 
 // type check
@@ -95,6 +98,13 @@ func newDoHClient(urlString string, r resolver.Resolver, preferH3 bool, params m
 		doh.skipCertVerify = true
 	}
 	doh.nameCertVerify = params["name-cert-verify"]
+	doh.echConfig = params["ech-config"]
+	if fallback := params["ech-fallback"]; fallback != "" && doh.echConfig != "" {
+		fallbackURL := *u
+		fallbackURL.Host = net.JoinHostPort(fallback, "443")
+		fallbackParams := map[string]string{"ech-config": doh.echConfig}
+		doh.echFallback = newDoHClient(fallbackURL.String(), r, preferH3, fallbackParams, proxyAdapter, proxyName)
+	}
 
 	runtime.SetFinalizer(doh, (*dnsOverHTTPS).Close)
 
@@ -107,6 +117,19 @@ func (doh *dnsOverHTTPS) Address() string {
 }
 
 func (doh *dnsOverHTTPS) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	if doh.echFallback == nil {
+		return doh.exchangePreferECH(ctx, m)
+	}
+	primaryCtx, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
+	msg, err = doh.exchangePreferECH(primaryCtx, m)
+	cancel()
+	if err != nil && ctx.Err() == nil {
+		return doh.echFallback.ExchangeContext(ctx, m)
+	}
+	return msg, err
+}
+
+func (doh *dnsOverHTTPS) exchangePreferECH(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	// Quote from https://www.rfc-editor.org/rfc/rfc8484.html:
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
@@ -132,6 +155,17 @@ func (doh *dnsOverHTTPS) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.
 
 	// Make the first attempt to send the DNS query.
 	msg, err = doh.exchangeHTTPS(ctx, client, m)
+	if doh.echConfig != "" {
+		var rejection *tls.ECHRejectionError
+		if errors.As(err, &rejection) && len(rejection.RetryConfigList) > 0 {
+			// TLS has authenticated the public name before returning retry keys.
+			client, err = doh.resetClient(ctx, err)
+			if err != nil {
+				return nil, fmt.Errorf("refresh DoH ECH configuration: %w", err)
+			}
+			msg, err = doh.exchangeHTTPS(ctx, client, m)
+		}
+	}
 
 	// Make up to 2 attempts to re-create the HTTP client and send the request
 	// again.  There are several cases (mostly, with QUIC) where this workaround
@@ -293,6 +327,11 @@ func (doh *dnsOverHTTPS) resetClient(ctx context.Context, resetErr error) (clien
 	doh.clientMu.Lock()
 	defer doh.clientMu.Unlock()
 
+	var rejection *tls.ECHRejectionError
+	if doh.echConfig != "" && errors.As(resetErr, &rejection) && len(rejection.RetryConfigList) > 0 {
+		doh.echRetryConfig = append([]byte(nil), rejection.RetryConfigList...)
+	}
+
 	if errors.Is(resetErr, quic.Err0RTTRejected) {
 		// Reset the TokenStore only if 0-RTT was rejected.
 		doh.resetQUICConfig()
@@ -397,6 +436,9 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
 	}
 
 	if doh.url.Scheme == "http" {
+		if doh.echConfig != "" {
+			return nil, errors.New("ECH requires an HTTPS DNS endpoint")
+		}
 		return transport, nil
 	}
 
@@ -410,6 +452,20 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
 	})
 	if err != nil {
 		return nil, err
+	}
+	if doh.echConfig != "" {
+		if doh.skipCertVerify || doh.nameCertVerify != "" {
+			return nil, errors.New("DoH ECH requires standard hostname and certificate verification")
+		}
+		config := doh.echRetryConfig
+		if len(config) == 0 {
+			config, err = base64.StdEncoding.DecodeString(doh.echConfig)
+			if err != nil || len(config) == 0 {
+				return nil, errors.New("invalid DoH ECHConfigList")
+			}
+		}
+		tlsConfig.MinVersion = tls.VersionTLS13
+		tlsConfig.EncryptedClientHelloConfigList = config
 	}
 	var nextProtos []string
 	for _, v := range doh.httpVersions {
